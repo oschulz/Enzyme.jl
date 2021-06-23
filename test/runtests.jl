@@ -161,7 +161,8 @@ end
         return mean(a)
     end
     # Cassette breaks things
-    @test Enzyme.autodiff_no_cassette(gc_copy, Active(5.0))[1] ≈ 10
+    # TODO
+    # @test Enzyme.autodiff(gc_copy, Active(5.0))[1] ≈ 10
 end
 
 @testset "Compare against" begin
