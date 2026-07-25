@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         version: ['1.12']
-        flags: ['ci', 'plain']
+        flags: ['ci', 'ci-patched']
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -35,13 +35,37 @@ jobs:
               PackageSpec(name="FiniteDifferences"),
             ])
             Pkg.precompile()'
+      - name: Build patched libEnzyme
+        if: ${{ matrix.flags == 'ci-patched' }}
+        env:
+          JULIA_PKG_SERVER_REGISTRY_PREFERENCE: eager
+        run: |
+          git clone --depth 1 --branch v0.0.288 https://github.com/EnzymeAD/Enzyme /tmp/enzyme-cpp
+          git -C /tmp/enzyme-cpp apply "$PWD/debug/lookup-recompute-budget.patch"
+          julia --color=yes --project=deps -e 'using Pkg; Pkg.instantiate()'
+          julia --color=yes --project=deps deps/build_local.jl /tmp/enzyme-cpp/enzyme
+          cp LocalPreferences.toml debugenv/
       - name: Run staged repro with watchdog
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq gdb
 
           FLAGS=()
-          if [ "${{ matrix.flags }}" = "ci" ]; then
+          if [ "${{ matrix.flags }}" != "plain" ]; then
             FLAGS=(--code-coverage=@$PWD --check-bounds=yes --depwarn=yes --inline=yes)
+          fi
+          if [ "${{ matrix.flags }}" = "ci-patched" ]; then
+            RUNS="budget-default budget-unlimited"
+          else
+            RUNS="single"
+          fi
+          for RUN in $RUNS; do
+          echo "════════════════ REPRO RUN: $RUN ════════════════"
+          if [ "$RUN" = "budget-unlimited" ]; then
+            export JULIA_LLVM_ARGS="-enzyme-lookup-recompute-budget=-1"
+            STAGE_LIMIT=2400
+          else
+            unset JULIA_LLVM_ARGS
+            STAGE_LIMIT=3600
           fi
           julia --color=no --project=debugenv "${FLAGS[@]}" debug/repro_stages.jl > repro.log 2>&1 &
           REPROPID=$!
@@ -57,10 +81,10 @@ jobs:
             sudo timeout 180 gdb -p $p --batch -ex 'set pagination off' -ex 'thread apply all bt 30' 2>&1 | head -300 || true
           }
 
-          STAGE_LIMIT=3600
           LAST_PROGRESS=$(date +%s)
           PREV_TAIL=""
           NPROBE=0
+          HUNG=""
           while kill -0 $REPROPID 2>/dev/null; do
             sleep 10
             TAIL=$(tail -1 repro.log 2>/dev/null || true)
@@ -87,13 +111,18 @@ jobs:
               pkill -9 -x julia || true
               echo "──── repro.log final (incl. SIGUSR1 output) ────"
               cat repro.log
-              echo "HANG CONFIRMED AND DUMPED (flags=${{ matrix.flags }})"
-              exit 0
+              HUNG=1
+              break
             fi
           done
-          echo "──── repro.log ────"
-          cat repro.log
-          echo "NO HANG (flags=${{ matrix.flags }})"
+          if [ -n "$HUNG" ]; then
+            echo "RUN VERDICT: HANG CONFIRMED AND DUMPED (flags=${{ matrix.flags }}, run=$RUN)"
+          else
+            echo "──── repro.log ────"
+            cat repro.log
+            echo "RUN VERDICT: no hang (flags=${{ matrix.flags }}, run=$RUN)"
+          fi
+          done
 
   suite:
     if: github.event_name == 'workflow_dispatch'
