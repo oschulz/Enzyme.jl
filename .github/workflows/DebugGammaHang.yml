@@ -1,0 +1,180 @@
+name: DebugGammaHang
+
+on:
+  push:
+    branches: ['debug/gamma-hang']
+  workflow_dispatch:
+
+jobs:
+  isolate:
+    timeout-minutes: 60
+    name: Isolate - Julia ${{ matrix.version }} - flags ${{ matrix.flags }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.12']
+        flags: ['ci', 'plain']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.version }}
+          arch: default
+      - uses: julia-actions/cache@v3
+      - name: Set up environment
+        env:
+          JULIA_PKG_SERVER_REGISTRY_PREFERENCE: eager
+        run: |
+          julia --color=yes --project=debugenv -e '
+            using Pkg
+            Pkg.develop(path=".")
+            Pkg.add([
+              PackageSpec(name="Gamma", version="1.1.0"),
+              PackageSpec(name="HypergeometricFunctions", version="0.3.29"),
+              PackageSpec(name="FiniteDifferences"),
+            ])
+            Pkg.precompile()'
+      - name: Run staged repro with watchdog
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+
+          FLAGS=()
+          if [ "${{ matrix.flags }}" = "ci" ]; then
+            FLAGS=(--code-coverage=@$PWD --check-bounds=yes --depwarn=yes --inline=yes)
+          fi
+          julia --color=no --project=debugenv "${FLAGS[@]}" debug/repro_stages.jl > repro.log 2>&1 &
+          REPROPID=$!
+
+          dump_stacks() {
+            local p=$1
+            echo "════════ DUMP of $p at $(date -u +%H:%M:%S) ════════"
+            grep -E "State|VmRSS|VmHWM" /proc/$p/status || true
+            echo "──── SIGUSR1 (julia profile peek, lands in repro.log) ────"
+            kill -USR1 $p || true
+            sleep 15
+            echo "──── gdb ────"
+            sudo timeout 180 gdb -p $p --batch -ex 'set pagination off' -ex 'thread apply all bt 30' 2>&1 | head -300 || true
+          }
+
+          STAGE_LIMIT=420
+          LAST_PROGRESS=$(date +%s)
+          PREV_TAIL=""
+          while kill -0 $REPROPID 2>/dev/null; do
+            sleep 10
+            TAIL=$(tail -1 repro.log 2>/dev/null || true)
+            if [ "$TAIL" != "$PREV_TAIL" ]; then
+              PREV_TAIL="$TAIL"
+              LAST_PROGRESS=$(date +%s)
+            fi
+            if [ $(( $(date +%s) - LAST_PROGRESS )) -gt $STAGE_LIMIT ]; then
+              echo "::warning::STAGE HANG detected (no progress for ${STAGE_LIMIT}s)"
+              echo "──── repro.log so far ────"
+              cat repro.log
+              JPID=$(pgrep -f "repro_stages.jl" | head -1)
+              dump_stacks $JPID
+              echo "═══ 60s, second dump (movement check) ═══"
+              sleep 60
+              dump_stacks $JPID
+              kill -9 $REPROPID 2>/dev/null || true
+              pkill -9 -x julia || true
+              echo "──── repro.log final (incl. SIGUSR1 output) ────"
+              cat repro.log
+              echo "HANG CONFIRMED AND DUMPED (flags=${{ matrix.flags }})"
+              exit 0
+            fi
+          done
+          echo "──── repro.log ────"
+          cat repro.log
+          echo "NO HANG (flags=${{ matrix.flags }})"
+
+  suite:
+    timeout-minutes: 115
+    name: Suite - Julia ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.10', '1.12']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.version }}
+          arch: default
+      - uses: julia-actions/cache@v3
+      - name: add EnzymeCore EnzymeTestUtils
+        shell: julia --color=yes --project=. {0}
+        run: |
+          using Pkg
+          Pkg.develop([PackageSpec(; path) for path in ("lib/EnzymeCore", "lib/EnzymeTestUtils")])
+          Pkg.instantiate()
+        if: ${{ matrix.version == '1.10' }}
+        env:
+          JULIA_PKG_SERVER_REGISTRY_PREFERENCE: eager
+      - uses: julia-actions/julia-buildpkg@v1
+        env:
+          JULIA_PKG_SERVER_REGISTRY_PREFERENCE: eager
+      - name: Run tests with hang watchdog
+        env:
+          JULIA_PKG_SERVER_REGISTRY_PREFERENCE: eager
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+
+          julia --color=yes --project=. -e 'import Pkg; Pkg.test(; coverage=true, julia_args=["--check-bounds=yes", "--compiled-modules=yes", "--depwarn=yes"], test_args=["--verbose"], force_latest_compatible_version=false, allow_reresolve=true)' > test.log 2>&1 &
+          TESTPID=$!
+
+          dump_stacks() {
+            echo "════════ DUMP at $(date -u +%H:%M:%S) ════════"
+            free -m
+            ps -eLo pid,ppid,etime,pcpu,rss,comm --sort=-pcpu | head -30
+            for p in $(pgrep -x julia); do
+              echo "──── /proc/$p/status ────"
+              grep -E "Name|State|Threads|VmRSS|VmHWM" /proc/$p/status || true
+            done
+            for p in $(pgrep -x julia); do
+              echo "──── gdb backtrace of julia pid $p ────"
+              sudo timeout 180 gdb -p $p --batch -ex 'set pagination off' -ex 'thread apply all bt 30' 2>&1 | head -400 || true
+            done
+          }
+
+          GAMMA_START=""
+          T0=$(date +%s)
+          HANG_LIMIT=900
+          GLOBAL_LIMIT=6000
+          while kill -0 $TESTPID 2>/dev/null; do
+            sleep 15
+            NOW=$(date +%s)
+            if [ -z "$GAMMA_START" ] && grep -qE "ext/gamma.*started at" test.log; then
+              GAMMA_START=$NOW
+              echo "::notice::ext/gamma started"
+            fi
+            HANG=""
+            if [ -n "$GAMMA_START" ] && [ "$GAMMA_START" != "done" ]; then
+              if grep -E "ext/gamma" test.log | grep -qE "\([0-9]+\) │ +[0-9]+\.[0-9]+ │|failed at"; then
+                echo "::notice::ext/gamma finished normally after $((NOW - GAMMA_START))s"
+                GAMMA_START="done"
+              elif [ $((NOW - GAMMA_START)) -gt $HANG_LIMIT ]; then
+                HANG="ext/gamma stuck for $((NOW - GAMMA_START))s"
+              fi
+            fi
+            if [ -z "$HANG" ] && [ $((NOW - T0)) -gt $GLOBAL_LIMIT ]; then
+              HANG="global time limit: something else is stuck"
+            fi
+            if [ -n "$HANG" ]; then
+              echo "::warning::HANG DETECTED: $HANG"
+              tail -60 test.log
+              dump_stacks
+              echo "═══ waiting 180s, then second dump (movement check) ═══"
+              sleep 180
+              dump_stacks
+              kill -9 $TESTPID 2>/dev/null || true
+              pkill -9 -x julia || true
+              echo "HANG CONFIRMED AND DUMPED"
+              exit 1
+            fi
+          done
+          wait $TESTPID; RC=$?
+          echo "suite finished without hang (exit $RC)"
+          tail -80 test.log
+          exit $RC
