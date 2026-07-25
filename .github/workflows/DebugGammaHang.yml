@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         version: ['1.12']
-        flags: ['ci', 'ci-patched']
+        flags: ['ci', 'ci-patched-default', 'ci-patched-unlimited']
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -33,10 +33,12 @@ jobs:
               PackageSpec(name="Gamma", version="1.1.0"),
               PackageSpec(name="HypergeometricFunctions", version="0.3.29"),
               PackageSpec(name="FiniteDifferences"),
+              PackageSpec(name="Enzyme_jll", version="0.0.288"),
+              PackageSpec(name="LLVM"),
             ])
             Pkg.precompile()'
       - name: Build patched libEnzyme
-        if: ${{ matrix.flags == 'ci-patched' }}
+        if: ${{ startsWith(matrix.flags, 'ci-patched') }}
         env:
           JULIA_PKG_SERVER_REGISTRY_PREFERENCE: eager
         run: |
@@ -53,20 +55,15 @@ jobs:
           if [ "${{ matrix.flags }}" != "plain" ]; then
             FLAGS=(--code-coverage=@$PWD --check-bounds=yes --depwarn=yes --inline=yes)
           fi
-          if [ "${{ matrix.flags }}" = "ci-patched" ]; then
-            RUNS="budget-default budget-unlimited"
-          else
-            RUNS="single"
-          fi
+          case "${{ matrix.flags }}" in
+            ci)                   RUNS="r1 r2 r3"; BUDGET="" ;;
+            ci-patched-default)   RUNS="r1 r2 r3"; BUDGET="100000" ;;
+            ci-patched-unlimited) RUNS="r1 r2";    BUDGET="-1" ;;
+          esac
+          STAGE_LIMIT=1200
           for RUN in $RUNS; do
-          echo "════════════════ REPRO RUN: $RUN ════════════════"
-          if [ "$RUN" = "budget-unlimited" ]; then
-            export JULIA_LLVM_ARGS="-enzyme-lookup-recompute-budget=-1"
-            STAGE_LIMIT=2400
-          else
-            unset JULIA_LLVM_ARGS
-            STAGE_LIMIT=3600
-          fi
+          echo "════════════════ REPRO RUN: $RUN (flags=${{ matrix.flags }}, budget=$BUDGET) ════════════════"
+          if [ -n "$BUDGET" ]; then export ENZYME_LOOKUP_RECOMPUTE_BUDGET="$BUDGET"; else unset ENZYME_LOOKUP_RECOMPUTE_BUDGET; fi
           julia --color=no --project=debugenv "${FLAGS[@]}" debug/repro_stages.jl > repro.log 2>&1 &
           REPROPID=$!
 
@@ -103,9 +100,6 @@ jobs:
               echo "──── repro.log so far ────"
               cat repro.log
               JPID=$(pgrep -f "repro_stages.jl" | head -1)
-              dump_stacks $JPID
-              echo "═══ 60s, second dump (movement check) ═══"
-              sleep 60
               dump_stacks $JPID
               kill -9 $REPROPID 2>/dev/null || true
               pkill -9 -x julia || true

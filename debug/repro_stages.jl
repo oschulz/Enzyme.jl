@@ -17,7 +17,14 @@ println("VERSION: ", VERSION); flush(stdout)
 
 @stage "load" begin
     using Enzyme, Gamma, HypergeometricFunctions, FiniteDifferences
+    import Enzyme_jll, LLVM
     @assert Base.get_extension(Enzyme, :EnzymeGammaExt) !== nothing
+    println("  libEnzyme: ", Enzyme_jll.libEnzyme)
+    budget = get(ENV, "ENZYME_LOOKUP_RECOMPUTE_BUDGET", "")
+    if !isempty(budget)
+        LLVM.clopts("-enzyme-lookup-recompute-budget=" * budget)
+        println("  lookup-recompute-budget: ", budget)
+    end
 end
 
 @stage "scalar reverse" begin
