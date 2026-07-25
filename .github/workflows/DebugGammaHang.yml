@@ -7,7 +7,7 @@ on:
 
 jobs:
   isolate:
-    timeout-minutes: 60
+    timeout-minutes: 100
     name: Isolate - Julia ${{ matrix.version }} - flags ${{ matrix.flags }}
     runs-on: ubuntu-24.04
     strategy:
@@ -57,15 +57,22 @@ jobs:
             sudo timeout 180 gdb -p $p --batch -ex 'set pagination off' -ex 'thread apply all bt 30' 2>&1 | head -300 || true
           }
 
-          STAGE_LIMIT=420
+          STAGE_LIMIT=3600
           LAST_PROGRESS=$(date +%s)
           PREV_TAIL=""
+          NPROBE=0
           while kill -0 $REPROPID 2>/dev/null; do
             sleep 10
             TAIL=$(tail -1 repro.log 2>/dev/null || true)
             if [ "$TAIL" != "$PREV_TAIL" ]; then
               PREV_TAIL="$TAIL"
               LAST_PROGRESS=$(date +%s)
+            fi
+            STALL=$(( $(date +%s) - LAST_PROGRESS ))
+            if [ $STALL -gt $(( (NPROBE + 1) * 600 )) ]; then
+              NPROBE=$((NPROBE + 1))
+              echo "::notice::stage stalled ${STALL}s, probe $NPROBE"
+              kill -USR1 $(pgrep -f "repro_stages.jl" | head -1) || true
             fi
             if [ $(( $(date +%s) - LAST_PROGRESS )) -gt $STAGE_LIMIT ]; then
               echo "::warning::STAGE HANG detected (no progress for ${STAGE_LIMIT}s)"
@@ -89,6 +96,7 @@ jobs:
           echo "NO HANG (flags=${{ matrix.flags }})"
 
   suite:
+    if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 115
     name: Suite - Julia ${{ matrix.version }}
     runs-on: ubuntu-24.04
