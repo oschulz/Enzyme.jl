@@ -1,8 +1,6 @@
 name: DebugGammaHang
 
 on:
-  push:
-    branches: ['debug/gamma-hang']
   workflow_dispatch:
 
 jobs:

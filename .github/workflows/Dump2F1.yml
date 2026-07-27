@@ -1,0 +1,131 @@
+name: Dump2F1
+
+on:
+  push:
+    branches: ['debug/gamma-hang']
+  workflow_dispatch:
+
+jobs:
+  dump:
+    name: Dump pre-AD module (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+          arch: default
+      - uses: julia-actions/cache@v3
+      - name: Set up environment
+        env:
+          JULIA_PKG_SERVER_REGISTRY_PREFERENCE: eager
+        run: |
+          julia --color=no --project=dumpenv -e '
+            using Pkg
+            Pkg.develop(path=".")
+            Pkg.add([
+              PackageSpec(name="Gamma", version="1.1.0"),
+              PackageSpec(name="HypergeometricFunctions", version="0.3.29"),
+              PackageSpec(name="FiniteDifferences"),
+              PackageSpec(name="Enzyme_jll", version="0.0.288"),
+            ])
+            Pkg.precompile()'
+      - name: Dump
+        run: |
+          mkdir -p dumps
+          ENZYME_DUMP_PREAD=$PWD/dumps/pread timeout 2400 julia --color=no --project=dumpenv debug/dump_2f1.jl > dumps/run.log 2>&1 || true
+          tail -5 dumps/run.log
+          ls -la dumps/
+          test -n "$(ls dumps/*.ll 2>/dev/null)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pre-ad-dump-x86_64
+          path: dumps/
+          if-no-files-found: error
+
+  replay:
+    name: Replay dumped IR via opt (x86_64)
+    needs: dump
+    runs-on: ubuntu-24.04
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+          arch: default
+      - uses: actions/download-artifact@v4
+        with:
+          name: pre-ad-dump-x86_64
+          path: dumps
+      - name: Fetch LLVM toolchain
+        run: |
+          julia --color=no -e '
+            using Pkg
+            Pkg.activate(; temp=true)
+            Pkg.add(name="LLVM_full_jll", version="18.1.7")
+            using LLVM_full_jll
+            println("LLVMDIR=", LLVM_full_jll.artifact_dir)' | tee llvmdir.txt
+          grep -oE "LLVMDIR=.*" llvmdir.txt | cut -d= -f2 > llvmdir.path
+          echo "LLVMDIR=$(cat llvmdir.path)" >> "$GITHUB_ENV"
+      - name: Build unpatched and patched plugins
+        run: |
+          git clone --depth 1 --branch v0.0.288 https://github.com/EnzymeAD/Enzyme /tmp/enzyme-clean
+          git clone --depth 1 --branch fix-lookup-recompute-blowup https://github.com/oschulz/Enzyme /tmp/enzyme-patched
+          for pair in clean patched; do
+            cmake -DLLVM_DIR=$LLVMDIR/lib/cmake/llvm -DCMAKE_BUILD_TYPE=Release \
+                  -DENZYME_EXTERNAL_SHARED_LIB=OFF \
+                  -B /tmp/build-$pair -S /tmp/enzyme-$pair/enzyme > /dev/null
+            cmake --build /tmp/build-$pair --parallel $(nproc) -t LLVMEnzyme-18 2>&1 | tail -1
+          done
+      - name: Replay
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+          LL=$(ls dumps/pread_*.ll | head -1)
+          PRIMALF=$(grep -oE "primalf *= *.*" dumps/*.meta | head -1 | sed 's/.*= *//')
+          echo "module: $LL   primal: $PRIMALF"
+          cp "$LL" replay.ll
+          {
+            printf '\ndeclare { double, double, double, double } @__enzyme_autodiff(i8*, ...)\n\n'
+            printf 'define { double, double, double, double } @enzyme_replay_df(double %%a, double %%b, double %%c, double %%z) {\n'
+            printf 'entry:\n'
+            printf '  %%r = call { double, double, double, double } (i8*, ...) @__enzyme_autodiff(i8* bitcast (double (double, double, double, double)* @%s to i8*), double %%a, double %%b, double %%c, double %%z)\n' "$PRIMALF"
+            printf '  ret { double, double, double, double } %%r\n}\n'
+          } >> replay.ll
+
+          runopt() { # $1 build, $2 cap
+            timeout $2 $LLVMDIR/tools/opt -load-pass-plugin=/tmp/build-$1/Enzyme/LLVMEnzyme-18.so \
+              -load=/tmp/build-$1/Enzyme/LLVMEnzyme-18.so --enzyme-attributor=0 \
+              -passes="enzyme" -enzyme-preopt=false -disable-verify -S replay.ll -o /dev/null 2>opt.err &
+            OPTPID=$!
+            SECS=0
+            while kill -0 $OPTPID 2>/dev/null; do
+              sleep 10; SECS=$((SECS+10))
+              if [ $SECS -eq 600 ]; then
+                echo "──── still running after 600s, gdb stack of opt ────"
+                P=$(pgrep -x opt | head -1)
+                sudo timeout 120 gdb -p $P --batch -ex 'set pagination off' -ex 'bt 40' 2>&1 | head -80 || true
+              fi
+            done
+            wait $OPTPID; RC=$?
+            tail -3 opt.err | cut -c1-200 || true
+            return $RC
+          }
+
+          for attempt in 1 2 3; do
+            echo "════ UNPATCHED attempt $attempt (cap 1200s) ════"
+            T0=$(date +%s)
+            if runopt clean 1200; then
+              echo "completed in $(( $(date +%s) - T0 ))s"
+            else
+              echo "TIMEOUT/FAIL after $(( $(date +%s) - T0 ))s"
+            fi
+          done
+          echo "════ PATCHED single run (cap 600s) ════"
+          T0=$(date +%s)
+          if runopt patched 600; then
+            echo "completed in $(( $(date +%s) - T0 ))s"
+          else
+            echo "TIMEOUT/FAIL after $(( $(date +%s) - T0 ))s"
+          fi
