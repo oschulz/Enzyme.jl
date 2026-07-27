@@ -6130,6 +6130,27 @@ end
         force_recompute!(mod)
         API.EnzymeDetectReadonlyOrThrow(mod)
 
+        if haskey(ENV, "ENZYME_DUMP_PREAD")
+            let base = ENV["ENZYME_DUMP_PREAD"] * "_" * first(LLVM.name(primalf), 40)
+
+                write(base * ".ll", string(mod))
+                open(base * ".meta", "w") do io
+                    println(io, "primalf       = ", LLVM.name(primalf))
+                    println(io, "TT            = ", TT)
+                    println(io, "mode          = ", mode)
+                    println(io, "width         = ", width)
+                    println(io, "parallel      = ", parallel)
+                    println(io, "actualRetType = ", actualRetType)
+                    println(io, "abiwrap       = ", abiwrap)
+                    println(io, "modifiedBetween = ", modifiedBetween)
+                    println(io, "returnPrimal  = ", returnPrimal)
+                    println(io, "expectedTapeType = ", expectedTapeType)
+                    println(io, "loweredArgs   = ", loweredArgs)
+                    println(io, "boxedArgs     = ", boxedArgs)
+                end
+            end
+        end
+
         adjointf, augmented_primalf, TapeType = enzyme!(
             enzyme_context,
             job,
